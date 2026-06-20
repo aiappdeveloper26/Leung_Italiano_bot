@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: italiano-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python italiano_bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false        # you paste this manually in the Render dashboard
