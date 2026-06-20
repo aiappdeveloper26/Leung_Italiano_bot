@@ -23,6 +23,8 @@ import asyncio
 import os
 import random
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from gtts import gTTS
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -823,6 +825,33 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  KEEP-ALIVE HTTP SERVER
+#  Render free Web Services need an HTTP port to stay alive.
+#  This tiny server runs in a background thread and answers /health.
+#  Point cron-job.org at  https://<your-app>.onrender.com/health  every 10 min
+#  to prevent the free-tier sleep.
+# ─────────────────────────────────────────────────────────────────────────────
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"OK - Italiano Bot is running!"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # silence HTTP access logs
+
+
+def _start_health_server() -> None:
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    print(f"🌐 Health endpoint listening on port {port}")
+    server.serve_forever()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -844,6 +873,10 @@ def main() -> None:
     app.add_handler(CommandHandler("progress", progress_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))
+
+    # Start keep-alive HTTP server in background thread
+    t = threading.Thread(target=_start_health_server, daemon=True)
+    t.start()
 
     print("🇮🇹 Italiano Bot is running — 20 lessons, 4 levels. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

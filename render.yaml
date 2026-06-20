@@ -1,9 +1,9 @@
 services:
-  - type: worker
+  - type: web              # free tier — Web Service (not Worker)
     name: italiano-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python italiano_bot.py
+    runtime: docker        # use our Dockerfile
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
-        sync: false        # you paste this manually in the Render dashboard
+        sync: false        # paste manually in Render dashboard
