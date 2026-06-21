@@ -20,10 +20,12 @@ SETUP
 """
 
 import asyncio
+import math
 import os
 import random
 import tempfile
 import threading
+from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from gtts import gTTS
@@ -40,6 +42,92 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_FROM_BOTFATHER_HERE")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SPACED REPETITION ENGINE  (SM-2 algorithm — same core as Anki / Duolingo)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#  Each word gets a card stored in user_data["srs"][key] with:
+#    interval   — days until next review (starts at 1)
+#    easiness   — difficulty multiplier (starts at 2.5, min 1.3)
+#    due        — ISO date string when the card is next due
+#    streak     — consecutive correct answers
+#
+#  Quality scores we use:
+#    5 = perfect  (first try correct)
+#    3 = correct after hesitation / second try
+#    1 = wrong
+#
+#  After each answer the interval is recalculated:
+#    wrong  → reset to 1 day
+#    right  → interval = round(interval * easiness)
+#    easiness adjusted by: easiness += 0.1 - (5-q)*(0.08+(5-q)*0.02)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _srs_key(italian: str) -> str:
+    """Stable dict key from an Italian phrase."""
+    return italian.lower().strip()
+
+
+def _today() -> str:
+    return date.today().isoformat()
+
+
+def _card_default() -> dict:
+    return {"interval": 1, "easiness": 2.5, "due": _today(), "streak": 0}
+
+
+def srs_update(user_data: dict, italian: str, quality: int) -> dict:
+    """
+    Update the SRS card for `italian` with answer quality (1/3/5).
+    Returns the updated card so the caller can show the next-due date.
+    """
+    cards = user_data.setdefault("srs", {})
+    key = _srs_key(italian)
+    card = cards.get(key, _card_default())
+
+    if quality >= 3:  # correct
+        if card["streak"] == 0:
+            new_interval = 1
+        elif card["streak"] == 1:
+            new_interval = 6
+        else:
+            new_interval = round(card["interval"] * card["easiness"])
+        card["streak"] += 1
+    else:  # wrong — reset
+        new_interval = 1
+        card["streak"] = 0
+
+    # Adjust easiness (clamp to min 1.3)
+    card["easiness"] = max(1.3, card["easiness"] + 0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
+    card["interval"] = new_interval
+    card["due"] = (date.today() + timedelta(days=new_interval)).isoformat()
+    cards[key] = card
+    return card
+
+
+def srs_due_cards(user_data: dict, level_key: str) -> list[tuple[str, str]]:
+    """Return all (italian, english) pairs that are due for review today."""
+    cards = user_data.get("srs", {})
+    today = _today()
+    pool = level_items(level_key)
+    due = []
+    for italian, english in pool:
+        key = _srs_key(italian)
+        card = cards.get(key, _card_default())
+        if card["due"] <= today:
+            due.append((italian, english))
+    return due
+
+
+def srs_stats(user_data: dict) -> dict:
+    """Return summary stats: total seen, due today, mastered (interval>=21)."""
+    cards = user_data.get("srs", {})
+    today = _today()
+    due = sum(1 for c in cards.values() if c["due"] <= today)
+    mastered = sum(1 for c in cards.values() if c["interval"] >= 21)
+    return {"total": len(cards), "due": due, "mastered": mastered}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LEVELS
@@ -535,16 +623,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "locals in Italy 🇮🇹\n\n"
         "*20 lessons across 4 levels:*\n"
         "🟢 Beginner · 🔵 Elementary · 🟡 Pre-Intermediate · 🟠 Intermediate\n\n"
+        "*🧠 Spaced Repetition (SRS)*\n"
+        "I track every word you learn and bring it back at the *perfect moment* "
+        "before you forget it — the same science used by Anki & Duolingo.\n\n"
         "*Commands*\n"
-        "📚 /lessons — browse all lessons\n"
-        "🗺 /level — choose your level & filter quiz\n"
-        "✈️ /travel — essential travel phrasebook\n"
-        "🔊 /say <text> — hear anything in Italian\n"
-        "📝 /quiz — test yourself\n"
-        "📊 /progress — your score\n"
+        "🔁 /review — study words due today ← *start here daily*\n"
+        "📚 /lessons — browse all 20 lessons\n"
+        "🗺 /level — set your level\n"
+        "✈️ /travel — travel phrasebook\n"
+        "🔊 /say <text> — hear any Italian phrase\n"
+        "📝 /quiz — random quiz question\n"
+        "📊 /progress — your score & SRS stats\n"
         "❓ /help — show this again\n\n"
-        "_Tip: type any Italian text and I'll pronounce it for you._\n\n"
-        "Start with 👉 /level to pick your level, then /lessons!"
+        "_Tip: type any Italian text and I'll pronounce it._\n\n"
+        "👉 Start with /level, then do /review every day!"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -639,23 +731,39 @@ async def progress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     answered = context.user_data.get("answered", 0)
     level = user_level(context.user_data)
     linfo = LEVELS[level]
+    stats = srs_stats(context.user_data)
+
     if answered == 0:
-        await update.message.reply_text("No quiz answers yet — try /quiz 📝")
+        await update.message.reply_text(
+            "No answers yet — try /review or /quiz 📝\n\n"
+            "_Your spaced repetition schedule builds up as you answer questions._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
+
     pct = round(100 * score / answered)
     bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+
+    if pct >= 80:
+        verdict = "🏆 Magnifico! You're crushing it!"
+    elif pct >= 60:
+        verdict = "👍 Molto bene! Keep it up!"
+    else:
+        verdict = "💪 Keep practising — you've got this!"
+
     msg = (
         f"📊 *Your Progress*\n"
-        f"Level: {linfo['emoji']} {linfo['label']}\n"
-        f"Score: {score}/{answered}  ({pct}%)\n"
-        f"[{bar}]\n\n"
+        f"Level: {linfo['emoji']} {linfo['label']}\n\n"
+        f"*Quiz accuracy*\n"
+        f"Correct: {score}/{answered}  ({pct}%)\n"
+        f"[{bar}]\n"
+        f"{verdict}\n\n"
+        f"*Spaced Repetition (SRS)*\n"
+        f"📚 Words seen: {stats['total']}\n"
+        f"🔁 Due for review today: {stats['due']}\n"
+        f"🧠 Mastered (21+ day interval): {stats['mastered']}\n\n"
+        f"_Use /review to study words due today._"
     )
-    if pct >= 80:
-        msg += "🏆 Magnifico! You're crushing it!"
-    elif pct >= 60:
-        msg += "👍 Molto bene! Keep it up!"
-    else:
-        msg += "💪 Keep practising — you've got this!"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -666,13 +774,24 @@ async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  QUIZ ENGINE
+#  QUIZ ENGINE  (SRS-aware)
 # ─────────────────────────────────────────────────────────────────────────────
-def build_quiz(level_key: str) -> dict:
-    pool = level_items(level_key)
+def build_quiz(level_key: str, user_data: dict) -> dict:
+    """
+    Pick the next word to quiz:
+      1. Prefer cards that are due for SRS review today.
+      2. Fall back to random from the level pool.
+    """
+    due = srs_due_cards(user_data, level_key)
+    pool = level_items(level_key) if level_key else ALL_ITEMS
     if len(pool) < 4:
-        pool = ALL_ITEMS   # fallback
-    italian, english = random.choice(pool)
+        pool = ALL_ITEMS
+
+    if due:
+        italian, english = random.choice(due)
+    else:
+        italian, english = random.choice(pool)
+
     ask_meaning = random.random() < 0.5
 
     if ask_meaning:
@@ -691,25 +810,48 @@ def build_quiz(level_key: str) -> dict:
         "correct": correct,
         "options": options,
         "italian": italian,
+        "is_srs": bool(due),
     }
 
 
 async def send_quiz(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_data: dict) -> None:
-    quiz = build_quiz(user_level(user_data))
+    quiz = build_quiz(user_level(user_data), user_data)
     user_data["quiz"] = quiz
+
+    due_count = len(srs_due_cards(user_data, user_level(user_data)))
+    header = f"🔁 *Review* ({due_count} due)\n" if quiz["is_srs"] else ""
+
     keyboard = [
         [InlineKeyboardButton(opt, callback_data=f"ans|{i}")]
         for i, opt in enumerate(quiz["options"])
     ]
     await context.bot.send_message(
         chat_id=chat_id,
-        text=quiz["prompt"],
+        text=header + quiz["prompt"],
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
 async def quiz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_quiz(context, update.effective_chat.id, context.user_data)
+
+
+async def review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a focused SRS review session (due cards only)."""
+    due = srs_due_cards(context.user_data, user_level(context.user_data))
+    if not due:
+        await update.message.reply_text(
+            "🎉 *Ottimo!* No words due for review right now.\n"
+            "Come back tomorrow — your next session will be ready then!\n\n"
+            "Want a random /quiz in the meantime?",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await update.message.reply_text(
+        f"🔁 *Review session* — {len(due)} word(s) due today.\nLet's go!",
+        parse_mode=ParseMode.MARKDOWN,
+    )
     await send_quiz(context, update.effective_chat.id, context.user_data)
 
 
@@ -802,26 +944,52 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         chosen = quiz["options"][int(data.split("|")[1])]
         correct = quiz["correct"]
+        italian = quiz["italian"]
+
         context.user_data["answered"] = context.user_data.get("answered", 0) + 1
+
         if chosen == correct:
             context.user_data["score"] = context.user_data.get("score", 0) + 1
+            quality = 5
             result = f"✅ *Esatto!*  The answer is *{correct}*"
         else:
+            quality = 1
             result = (
                 f"❌ Not quite.\n"
                 f"You chose: *{chosen}*\n"
                 f"Correct: *{correct}*"
             )
+
+        # Update SRS card
+        card = srs_update(context.user_data, italian, quality)
+        due_days = card["interval"]
+        streak = card["streak"]
+
+        if quality >= 3:
+            if due_days == 1:
+                srs_line = f"🔁 Review again *tomorrow*"
+            elif due_days <= 7:
+                srs_line = f"🔁 Next review in *{due_days} days*  (streak: {streak} ✨)"
+            else:
+                srs_line = f"🧠 Well known! Next review in *{due_days} days*  (streak: {streak} 🔥)"
+        else:
+            srs_line = "🔁 Added back to *review tomorrow* — you'll nail it next time!"
+
+        # Check remaining due cards
+        due_left = len(srs_due_cards(context.user_data, user_level(context.user_data)))
+        due_line = f"\n_{due_left} card(s) still due today_" if due_left > 0 else "\n_All reviews done for today! 🎉_"
+
         follow = [[
             InlineKeyboardButton("🔊 Hear it", callback_data="hearquiz"),
-            InlineKeyboardButton("➡️ Next question", callback_data="newquiz"),
+            InlineKeyboardButton("➡️ Next", callback_data="newquiz"),
         ]]
         await query.edit_message_text(
-            f"{quiz['prompt']}\n\n{result}",
+            f"{quiz['prompt']}\n\n{result}\n\n{srs_line}{due_line}",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(follow),
         )
         return
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -870,6 +1038,7 @@ def main() -> None:
     app.add_handler(CommandHandler("travel",   travel_cmd))
     app.add_handler(CommandHandler("say",      say_cmd))
     app.add_handler(CommandHandler("quiz",     quiz_cmd))
+    app.add_handler(CommandHandler("review",   review_cmd))
     app.add_handler(CommandHandler("progress", progress_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))
