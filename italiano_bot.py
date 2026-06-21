@@ -74,17 +74,33 @@ def _today() -> str:
 
 
 def _card_default() -> dict:
-    return {"interval": 1, "easiness": 2.5, "due": _today(), "streak": 0}
+    """A brand-new card — NOT due yet. Due date is set when the word is seeded."""
+    return {"interval": 1, "easiness": 2.5, "due": None, "streak": 0}
+
+
+def srs_seed(user_data: dict, italian: str) -> None:
+    """
+    Mark a word as 'seen in a lesson' — schedule its first review for today.
+    Only seeds if the card doesn't exist yet (so we never overwrite progress).
+    """
+    cards = user_data.setdefault("srs", {})
+    key = _srs_key(italian)
+    if key not in cards:
+        card = _card_default()
+        card["due"] = _today()   # first review: right now / today
+        cards[key] = card
 
 
 def srs_update(user_data: dict, italian: str, quality: int) -> dict:
     """
     Update the SRS card for `italian` with answer quality (1/3/5).
-    Returns the updated card so the caller can show the next-due date.
+    Also seeds the card if it has never been seen (e.g. quiz without prior lesson).
+    Returns the updated card.
     """
-    cards = user_data.setdefault("srs", {})
+    srs_seed(user_data, italian)          # ensure card exists
+    cards = user_data["srs"]
     key = _srs_key(italian)
-    card = cards.get(key, _card_default())
+    card = cards[key]
 
     if quality >= 3:  # correct
         if card["streak"] == 0:
@@ -94,11 +110,10 @@ def srs_update(user_data: dict, italian: str, quality: int) -> dict:
         else:
             new_interval = round(card["interval"] * card["easiness"])
         card["streak"] += 1
-    else:  # wrong — reset
+    else:  # wrong — reset to 1 day
         new_interval = 1
         card["streak"] = 0
 
-    # Adjust easiness (clamp to min 1.3)
     card["easiness"] = max(1.3, card["easiness"] + 0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
     card["interval"] = new_interval
     card["due"] = (date.today() + timedelta(days=new_interval)).isoformat()
@@ -107,26 +122,33 @@ def srs_update(user_data: dict, italian: str, quality: int) -> dict:
 
 
 def srs_due_cards(user_data: dict, level_key: str) -> list[tuple[str, str]]:
-    """Return all (italian, english) pairs that are due for review today."""
+    """
+    Return all (italian, english) pairs that:
+      - have been seeded (lesson opened or quizzed at least once), AND
+      - are due for review today or overdue.
+    Words never seen are NOT included.
+    """
     cards = user_data.get("srs", {})
     today = _today()
     pool = level_items(level_key)
     due = []
     for italian, english in pool:
         key = _srs_key(italian)
-        card = cards.get(key, _card_default())
-        if card["due"] <= today:
+        card = cards.get(key)
+        # card must exist AND have a due date (not None) AND be due
+        if card and card.get("due") and card["due"] <= today:
             due.append((italian, english))
     return due
 
 
 def srs_stats(user_data: dict) -> dict:
-    """Return summary stats: total seen, due today, mastered (interval>=21)."""
+    """Return summary stats: total seeded, due today, mastered (interval>=21)."""
     cards = user_data.get("srs", {})
     today = _today()
-    due = sum(1 for c in cards.values() if c["due"] <= today)
-    mastered = sum(1 for c in cards.values() if c["interval"] >= 21)
-    return {"total": len(cards), "due": due, "mastered": mastered}
+    seeded = [c for c in cards.values() if c.get("due") is not None]
+    due = sum(1 for c in seeded if c["due"] <= today)
+    mastered = sum(1 for c in seeded if c["interval"] >= 21)
+    return {"total": len(seeded), "due": due, "mastered": mastered}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -882,16 +904,23 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if data.startswith("lesson|"):
         idx = int(data.split("|")[1])
         lesson = LESSONS[idx]
+
+        # Seed every word in this lesson into the user's SRS deck (first-time only)
+        for italian, _ in lesson["items"]:
+            srs_seed(context.user_data, italian)
+        newly_seeded = len(lesson["items"])
+
         lines = [f"*{lesson['title']}*"]
         if lesson.get("tip"):
             lines.append(f"\n{lesson['tip']}\n")
         for it, en in lesson["items"]:
             lines.append(f"• *{it}* — {en}")
+        lines.append(f"\n_✅ {newly_seeded} words added to your review deck!_")
         buttons = [
             [InlineKeyboardButton(f"🔊 {it}", callback_data=f"say|{idx}|{i}")]
             for i, (it, _) in enumerate(lesson["items"])
         ]
-        buttons.append([InlineKeyboardButton("📝 Quiz on this level", callback_data="newquiz")])
+        buttons.append([InlineKeyboardButton("🔁 Review these words now", callback_data="newquiz")])
         # Split into chunks to avoid Telegram's 4096-char limit
         full = "\n".join(lines)
         if len(full) > 4000:
