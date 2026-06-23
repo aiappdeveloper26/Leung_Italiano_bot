@@ -1037,6 +1037,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, *args):
         pass  # silence HTTP access logs
 
@@ -1057,8 +1061,24 @@ def main() -> None:
             "❗ Set your bot token first:\n"
             '   export BOT_TOKEN="your-token-here"'
         )
-    persistence = PicklePersistence(filepath="italiano_bot_data.pickle")
+
+    # ── 1. Start HTTP keep-alive server FIRST (Render checks port on startup) ─
+    t = threading.Thread(target=_start_health_server, daemon=True)
+    t.start()
+
+    # ── 2. Use /tmp for pickle — writable on Render's ephemeral filesystem ────
+    #       (scores reset on redeploy; acceptable for a free-tier bot)
+    pickle_path = os.environ.get("PICKLE_PATH", "/tmp/italiano_bot_data.pickle")
+    persistence = PicklePersistence(filepath=pickle_path)
+
+    # ── 3. Build app with error handler so crashes are logged, not silent ─────
     app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        import traceback
+        print(f"❌ Exception:\n{''.join(traceback.format_exception(None, context.error, context.error.__traceback__))}")
+
+    app.add_error_handler(error_handler)
 
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CommandHandler("help",     help_cmd))
@@ -1072,12 +1092,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text))
 
-    # Start keep-alive HTTP server in background thread
-    t = threading.Thread(target=_start_health_server, daemon=True)
-    t.start()
-
     print("🇮🇹 Italiano Bot is running — 20 lessons, 4 levels. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # ignore messages sent while bot was offline
+    )
 
 
 if __name__ == "__main__":
